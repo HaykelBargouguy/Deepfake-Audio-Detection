@@ -1,63 +1,25 @@
-# ASVspoof
+# ASVSpoof Anti-Spoofing Detection Framework
 
-## Timelines
-**[20/10 - 26/10]**
+This project targets Automatic Speaker Verification (ASV) anti-spoofing detection, specifically geared towards the ASVspoof datasets. It provides a robust, dual-pipeline framework featuring both Deep Learning end-to-end approaches and Classical Machine Learning baselines.
 
-[1] Shentong/Haofan: python reimplementation of CQCC
+## Architecture Description
 
-[2] Chi: X-vector feature extraction
+### Deep Learning Pipeline
+The core deep learning approach utilizes a **ResNet Architecture integrated with a Custom Self-Attention Mechanism**.
+1. **Feature Extraction:** Raw audio is padded and normalized before being transformed into specific frequency representations (MFCC, LFCC, or CQCC).
+2. **ResNet Backbone:** A modified ResNet utilizing `PreActBlocks` processes the 2D spatial features to capture local structural anomalies inherent to synthetic speech.
+3. **Custom Self-Attention Mechanism:** After the convolutional stages, the frequency axis is flattened. A custom self-attention mechanism computes learnable weights for the temporal sequence, dynamically identifying and aggregating the most informative frames into a compact, utterance-level representation. This module computes both the mean and standard deviation.
+4. **Classification:** The vector is passed through fully connected layers, optimized using custom margins like **OCSoftmax**.
 
-[3] Pinxu: GMM/SVM classifier build 
+### Machine Learning Baselines
+For comparative robustness, the project includes classical ML techniques that operate on offline-extracted, flattened feature representations:
+* **Support Vector Machines (SVM)**
+* **LightGBM** (Gradient Boosting)
 
+## Dataset Context
+The framework is pre-configured to handle the **ASVspoof 2019** dataset configurations, supporting both Logical Access (LA) and Physical Access (PA).
 
-## Dataset (LA)
-Google drive: https://drive.google.com/file/d/1UGs1o2mDiBO9_iaN-0FupS8x0Tkb4xmt/view?usp=sharing
-
-## Feature Extraction
-### CQCC (baseline)
-```
-python3 data_processing.py --data_path ./LA/ASVspoof2019_LA_train/flac --output_path ./data/train_cqcc.pkl --label_path ./LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt --feature_type cqcc 
-```
-```
-python3 data_processing.py --data_path ./LA/ASVspoof2019_LA_dev/flac --output_path ./data/dev_cqcc.pkl --label_path ./LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt --feature_type cqcc
-```
-```
-python3 data_processing.py --data_path ./LA/ASVspoof2019_LA_eval/flac --output_path ./data/eval_cqcc.pkl --label_path ./LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.eval.trl.txt --feature_type cqcc
-```
-
-The saved pickle file has the format: [(cqcc_vec[timestepx60], label[bonafide/spoof]) x N instances]
-
-### MFCC
-```
-python3 data_processing.py --data_path ./LA/ASVspoof2019_LA_train/flac --output_path ./data/train_mfcc.pkl --label_path ./LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt --feature_type mfcc
-```
-```
-python3 data_processing.py --data_path ./LA/ASVspoof2019_LA_dev/flac --output_path ./data/dev_mfcc.pkl --label_path ./LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt --feature_type mfcc
-```
-```
-python3 data_processing.py --data_path ./LA/ASVspoof2019_LA_eval/flac --output_path ./data/eval_mfcc.pkl --label_path ./LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.eval.trl.txt --feature_type mfcc
-```
-
-The saved pickle file has the format: [(mfcc_vec[timestepx13], label[bonafide/spoof]) x N instances]
-
-## Classifier
-
-### GMM
-
-
-### SVM
-```
-python3 SVM.py --data_path ./data/train.pkl --feature_type mfcc
-```
-```
-python3 SVM_test.py --data_path ./data/dev.pkl --feature_type mfcc
-```
-```
-python3 SVM_test.py --data_path ./data/eval.pkl --feature_type mfcc
-```
-
-
-## Referecne
-[1] Ensemble Models for Spoofing Detection in Automatic Speaker Verification, 2019 Interspeech. 
-
-[2] IIIT-H Spoofing Countermeasures for Automatic Speaker Verification, 2019 Interspeech. 
+## Training and Validation Pipeline
+1. **Config:** All hyperparameters are centralized in `configs/config.py`.
+2. **Deep Learning:** Execute `python -m src.dl_train`.
+3. **Machine Learning:** Execute `python -m src.ml_train` after extracting offline features via the scripts in `src/features/`.
