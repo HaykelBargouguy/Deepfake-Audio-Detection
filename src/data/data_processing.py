@@ -5,7 +5,6 @@ import argparse
 import soundfile as sf
 from tqdm import tqdm
 
-# Assuming CQCC and MFCC are imported from the refactored src.features
 from src.features.cqcc import cqcc
 from src.features.extract import extract_mfcc
 
@@ -36,7 +35,7 @@ def process_data(data_path, label_path, output_path, max_files=None):
         
         sig, rate = sf.read(filepath)
         
-        # Note: CQCC parameters are hardcoded here based on your original spec
+        # Note: CQCC parameters are configured based on original specification
         fmax = rate / 2
         fmin = fmax / 2**9
         feat_cqcc, _, _, _, _, _, _ = cqcc(sig, rate, 96, fmax, fmin, 16, 19, 'ZsdD')
@@ -47,6 +46,8 @@ def process_data(data_path, label_path, output_path, max_files=None):
         feats.append((feat_cqcc.T, feat_mfcc, label))
 
     print(f"Saved {len(feats)} instances to {output_path}")
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'wb') as outfile:
         pickle.dump(feats, outfile)
 
