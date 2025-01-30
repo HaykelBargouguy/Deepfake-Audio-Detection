@@ -1,2 +1,6 @@
 Data/LA
 venv
+
+# Ignored Local Data Folders
+embedding_files/
+csv_data/
