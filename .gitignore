@@ -4,3 +4,8 @@ venv
 # Ignored Local Data Folders
 embedding_files/
 csv_data/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*.class
