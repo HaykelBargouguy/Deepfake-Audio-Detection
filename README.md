@@ -1,4 +1,4 @@
-# Deepfake Audio Detection: ASVspoof Anti-Spoofing Framework
+# Deepfake Audio Detection: ASVspoof Anti-Spoofing
 
 ## 📌 Project Overview
 Automatic Speaker Verification (ASV) systems are highly vulnerable to spoofing attacks, including Voice Conversion (VC), Text-To-Speech (TTS), and replay attacks. This repository provides a robust, dual-pipeline framework (Machine Learning & Deep Learning) designed to act as a countermeasure (CM) gatekeeper. It classifies incoming audio utterances as either **Bona Fide** (genuine human speech) or **Spoof** (synthetically generated or replayed speech).
