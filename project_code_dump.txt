@@ -1,0 +1,966 @@
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\dl_train.py
+==================================================
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from configs.config import ProjectConfig
+from src.data.dataset import ASVSpoofDataset
+from src.models.resnet import ResNetAttention
+from src.models.loss import OCSoftmax
+from src.features.extract import get_transform
+
+def train():
+    cfg = ProjectConfig()
+    os.makedirs(cfg.out_fold, exist_ok=True)
+    
+    transform = get_transform(cfg.feature_type)
+    
+    train_set = ASVSpoofDataset(cfg.logical_data_root, track='LA', is_train=True, transform=transform)
+    train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True)
+    
+    model = ResNetAttention(enc_dim=cfg.enc_dim).to(cfg.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    
+    criterion = nn.CrossEntropyLoss()
+    loss_model = OCSoftmax(feat_dim=cfg.enc_dim, r_real=cfg.r_real, r_fake=cfg.r_fake, alpha=cfg.alpha).to(cfg.device)
+    loss_optimizer = torch.optim.SGD(loss_model.parameters(), lr=cfg.learning_rate)
+
+    print("Starting Deep Learning Training...")
+    for epoch in range(cfg.num_epochs):
+        model.train()
+        epoch_loss = 0.0
+        
+        for lfcc, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.num_epochs}"):
+            lfcc = lfcc.unsqueeze(1).float().to(cfg.device)
+            labels = labels.type(torch.LongTensor).to(cfg.device)
+            
+            feats, outputs = model(lfcc)
+            
+            oc_loss, _ = loss_model(feats, labels)
+            loss = oc_loss
+            
+            optimizer.zero_grad()
+            loss_optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            loss_optimizer.step()
+            
+            epoch_loss += loss.item()
+            
+        print(f"Epoch {epoch+1} Loss: {epoch_loss / len(train_loader):.4f}")
+        
+        torch.save(model.state_dict(), os.path.join(cfg.out_fold, f'resnet_attn_{epoch}.pt'))
+
+if __name__ == '__main__':
+    train()
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\ml_train.py
+==================================================
+import pickle
+import os
+import pandas as pd
+from sklearn.svm import SVC
+from lightgbm import LGBMClassifier
+from configs.config import ProjectConfig
+
+def train_ml_baselines(data_path):
+    cfg = ProjectConfig()
+    os.makedirs(cfg.out_fold, exist_ok=True)
+    
+    print(f"Loading features from {data_path}...")
+    data = pd.read_csv(data_path)
+    y = data['target'].values
+    X = data.drop(['target'], axis=1).values
+    
+    print('SVM Training Started...')
+    svm_clf = SVC(class_weight='balanced', probability=True)
+    svm_clf.fit(X, y)
+    with open(os.path.join(cfg.out_fold, 'svm_baseline.pkl'), 'wb') as f:
+        pickle.dump(svm_clf, f)
+    print('SVM Training Completed.')
+
+    print('LightGBM Training Started...')
+    lgbm_clf = LGBMClassifier(
+        bagging_fraction=0.82, feature_fraction=0.42, 
+        max_depth=24, num_leaves=82
+    )
+    lgbm_clf.fit(X, y)
+    with open(os.path.join(cfg.out_fold, 'lightgbm_baseline.pkl'), 'wb') as f:
+        pickle.dump(lgbm_clf, f)
+    print('LightGBM Training Completed.')
+
+if __name__ == "__main__":
+    train_ml_baselines('Data/pa-features/train_feats.csv')
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\data\dataset.py
+==================================================
+import os
+import torch
+import librosa
+import numpy as np
+from torch.utils.data import Dataset
+
+def pad_audio(x, max_len=64000):
+    x_len = x.shape[0]
+    if x_len >= max_len:
+        return x[:max_len]
+    num_repeats = (max_len // x_len) + 1
+    x_repeat = np.repeat(x, num_repeats)
+    return x_repeat[:max_len]
+
+class ASVSpoofDataset(Dataset):
+    def __init__(self, data_root, track='LA', is_train=True, is_eval=False, transform=None):
+        self.data_root = data_root
+        self.track = track
+        self.prefix = f'ASVspoof2019_{track}'
+        self.transform = transform
+        
+        if is_eval:
+            self.dset_name = 'eval'
+            self.protocols_fname = 'eval.trl'
+        elif is_train:
+            self.dset_name = 'train'
+            self.protocols_fname = 'train.trn'
+        else:
+            self.dset_name = 'dev'
+            self.protocols_fname = 'dev.trl'
+            
+        self.protocols_dir = os.path.join(self.data_root, f'{self.prefix}_cm_protocols/')
+        self.files_dir = os.path.join(self.data_root, f'{self.prefix}_{self.dset_name}', 'flac/')
+        self.protocols_path = os.path.join(self.protocols_dir, f'ASVspoof2019.{track}.cm.{self.protocols_fname}.txt')
+        
+        self.sound_files = os.listdir(self.files_dir)
+        with open(self.protocols_path, 'r') as f:
+            self.lines = f.readlines()
+
+    def __len__(self):
+        return len(self.lines)
+
+    def __getitem__(self, idx):
+        tokens = self.lines[idx].strip().split(' ')
+        filename = tokens[1] + '.flac' if self.dset_name != 'eval' else tokens[0] + '.flac'
+        sound_file = os.path.join(self.files_dir, filename)
+        
+        waveform, sr = librosa.load(sound_file, sr=16000)
+        waveform = pad_audio(waveform)
+        
+        if self.transform:
+            waveform = self.transform(waveform)
+            
+        y = int(tokens[4] == 'spoof') if len(tokens) > 4 else 0
+        return torch.Tensor(waveform), y
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\data\data_processing.py
+==================================================
+import os
+import random
+import pickle
+import argparse
+import soundfile as sf
+from tqdm import tqdm
+
+from src.features.cqcc import cqcc
+from src.features.extract import extract_mfcc
+
+def process_data(data_path, label_path, output_path, max_files=None):
+    # Read in labels
+    filename2label = {}
+    with open(label_path, 'r') as f:
+        for line in f:
+            tokens = line.strip().split()
+            filename, label = tokens[1], tokens[-1]
+            filename2label[filename] = label
+
+    all_files = [f for f in os.listdir(data_path) if f.endswith('.flac')]
+    random.shuffle(all_files)
+    
+    if max_files:
+        all_files = all_files[:max_files]
+
+    feats = []
+    
+    for filename in tqdm(all_files, desc="Processing Audio Files"):
+        file_id = filename.split('.')[0]
+        if file_id not in filename2label:
+            continue  # Skip files not in the protocol
+            
+        label = filename2label[file_id]
+        filepath = os.path.join(data_path, filename)
+        
+        sig, rate = sf.read(filepath)
+        
+        # Note: CQCC parameters are configured based on original specification
+        fmax = rate / 2
+        fmin = fmax / 2**9
+        feat_cqcc, _, _, _, _, _, _ = cqcc(sig, rate, 96, fmax, fmin, 16, 19, 'ZsdD')
+        
+        # MFCC Extraction using the refactored pipeline
+        feat_mfcc = extract_mfcc(sig, sr=rate)
+        
+        feats.append((feat_cqcc.T, feat_mfcc, label))
+
+    print(f"Saved {len(feats)} instances to {output_path}")
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'wb') as outfile:
+        pickle.dump(feats, outfile)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", required=True, type=str)
+    parser.add_argument("--label_path", required=True, type=str)
+    parser.add_argument("--output_path", required=True, type=str)
+    args = parser.parse_args()
+    
+    process_data(args.data_path, args.label_path, args.output_path)
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\features\cqcc.py
+==================================================
+import numpy as np
+import math
+from CQCC.CQT_toolbox_2013.cqt import cqt
+# import scikits.samplerate as sk_samplerate
+import scipy
+import librosa
+
+
+def cqcc(*args):
+    # %   Constant Q cepstral coefficients
+    # %   Usage:  CQcc = cqcc(x, fs, B, fmax, fmin, d, cf, ZsdD)
+    # %
+    # %   Input parameters:
+    # %         x        : input signal
+    # %         fs       : sampling frequency
+    # %         B        : number of bins per octave [default = 96]
+    # %         fmax     : highest frequency to be analyzed [default = Nyquist frequency]
+    # %         fmin     : lowest frequency to be analyzed [default = ~20Hz to fullfill an integer number of octave]
+    # %         d        : number of uniform samples in the first octave [default 16]
+    # %         cf       : number of cepstral coefficients excluding 0'th coefficient [default 19]
+    # %         ZsdD     : any sensible combination of the following  [default ZsdD]:
+    # %                      'Z'  include 0'th order cepstral coefficient
+    # %                      's'  include static coefficients (c)
+    # %                      'd'  include delta coefficients (dc/dt)
+    # %                      'D'  include delta-delta coefficients (d^2c/dt^2)
+    # %
+    # %   Output parameters:
+    # %         CQcc              : constant Q cepstral coefficients (nCoeff x nFea)
+    # %         LogP_absCQT       : log power magnitude spectrum of constant Q trasform
+    # %         TimeVec           : time at the centre of each frame [sec]
+    # %         FreqVec           : center frequencies of analysis filters [Hz]
+    # %         Ures_LogP_absCQT  : uniform resampling of LogP_absCQT
+    # %         Ures_FreqVec      : uniform resampling of FreqVec [Hz]
+    # %
+    # %   See also:  cqt
+    # %
+    # %
+    # %   References:
+    # %     M. Todisco, H. Delgado, and N. Evans. A New Feature for Automatic
+    # %     Speaker Verification Anti-Spoofing: Constant Q Cepstral Coefficients.
+    # %     Proceedings of ODYSSEY - The Speaker and Language Recognition
+    # %     Workshop, 2016.
+    # %
+    # %     C. Sch�rkhuber, A. Klapuri, N. Holighaus, and M. D�fler. A Matlab
+    # %     Toolbox for Efficient Perfect Reconstruction log-f Time-Frequecy
+    # %     Transforms. Proceedings AES 53rd Conference on Semantic Audio, London,
+    # %     UK, Jan. 2014. http://www.cs.tut.fi/sgn/arg/CQT/
+    # %
+    # %     G. A. Velasco, N. Holighaus, M. D�fler, and T. Grill. Constructing an
+    # %     invertible constant-Q transform with non-stationary Gabor frames.
+    # %     Proceedings of DAFX11, Paris, 2011.
+    # %
+    # %     N. Holighaus, M. D�fler, G. Velasco, and T. Grill. A framework for
+    # %     invertible, real-time constant-q transforms. Audio, Speech, and
+    # %     Language Processing, IEEE Transactions on, 21(4):775-785, April 2013.
+    # %
+    # %
+    # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    # %
+    # % Copyright (C) 2016 EURECOM, France.
+    # %
+    # % This work is licensed under the Creative Commons
+    # % Attribution-NonCommercial-ShareAlike 4.0 International
+    # % License. To view a copy of this license, visit
+    # % http://creativecommons.org/licenses/by-nc-sa/4.0/
+    # % or send a letter to
+    # % Creative Commons, 444 Castro Street, Suite 900,
+    # % Mountain View, California, 94041, USA.
+    # %
+    # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    # %
+    # % Authors: Massimiliano Todisco {todisco [at] eurecom [dot] fr}
+    # %          Hector Delgado {delgado [at] eurecom [dot] fr}
+    # %
+    # % Version: 1.0
+    # % Date: 22.01.16
+    # %
+    # % User are requested to cite the following paper in papers which report 
+    # % results obtained with this software package.	
+    # %
+    # %     M. Todisco, H. Delgado, and N. Evans. A New Feature for Automatic
+    # %     Speaker Verification Anti-Spoofing: Constant Q Cepstral Coefficients.
+    # %     Proceedings of ODYSSEY - The Speaker and Language Recognition
+    # %     Workshop, 2016.
+    # %
+    # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    # CHECK INPUT PARAMETERS
+    nargin = len(args)
+    # print("cqcc_nargin:", nargin)
+    if nargin < 2:
+        raise ValueError('Not enough input arguments.')
+
+    x, fs = args[:2]
+
+    # DEFAULT INPUT PARAMETERS
+    if nargin < 3:
+        B = 96
+    else: 
+        B = args[2]
+
+    if nargin < 4: 
+        fmax = fs/2
+    else:
+        fmax = args[3]
+
+    if nargin < 5:
+        oct = math.ceil(math.log(fmax/20, 2))
+        fmin = fmax/2**oct
+    else:
+        fmin = args[4]
+
+    if nargin < 6:
+        d = 16
+    else:
+        d = args[5]
+
+    if nargin < 7:
+        cf = 19
+    else:
+        cf = args[6]
+
+    if nargin < 8:
+        ZsdD = 'ZsdD'
+    else:
+        ZsdD = args[7]
+
+    gamma = 228.7*(2**(1/B)-2**(-1/B))
+    # print("cqcc_gamma", gamma)
+
+    # print("X:", x.shape)
+
+    # CQT COMPUTING
+    Xcq = cqt(x, B, fs, fmin, fmax, 'rasterize', 'full', 'gamma', gamma)
+    # LOG POWER SPECTRUM
+    absCQT = abs(Xcq['c'])
+    # print(absCQT.shape)
+    # print(absCQT[0][:5])
+
+    TimeVec = np.arange(1, absCQT.shape[1]+1).reshape(1,-1)
+    # print(TimeVec.shape)
+    # print(TimeVec)
+    TimeVec = TimeVec*Xcq['xlen'] / absCQT.shape[1] / fs
+    # print(TimeVec.shape)
+    # print(TimeVec[:,:5])
+
+    FreqVec = np.arange(0, absCQT.shape[0]).reshape(1,-1)
+    # print(FreqVec.shape)
+    # print(FreqVec[:5])
+
+    FreqVec = fmin*(2**(FreqVec/B))
+    # print(FreqVec.shape)             # (1, 863)
+    # print(FreqVec[:,:20])   
+    # print(FreqVec[:,-20:])   
+
+    eps = 2.2204e-16
+    LogP_absCQT = np.log(absCQT**2 + eps)     
+    # print(LogP_absCQT.shape)        # (863, 470)
+    # print(LogP_absCQT[0][:5])
+
+
+    # UNIFORM RESAMPLING
+    kl = B*math.log(1+1/d, 2)
+    # LogP_absCQT = np.asfortranarray(LogP_absCQT.T)
+
+    # import resampy
+
+    fs = 1/(fmin*(2**(kl/B)-1))  # 1.024
+    p = 1
+    q = 1
+    # new_sr = fs * q/p   
+    # print(fs)
+
+    ############ Output value a little bit different from results used by Matlab resample ############
+    Ures_LogP_absCQT = librosa.resample(LogP_absCQT.T,orig_sr=fs,target_sr=9.562).T
+    #print(Ures_LogP_absCQT[0,0])
+    Ures_FreqVec = None
+    # print(Ures_LogP_absCQT.shape)   # (8059, 470)     
+    # print(Ures_LogP_absCQT[:10,0])  
+
+    # DCT
+    CQcepstrum = scipy.fftpack.dct(Ures_LogP_absCQT, type=2, axis=1, norm='ortho')
+    # print(CQcepstrum.shape)
+    # print(CQcepstrum[:10,0])
+
+    # DYNAMIC COEFFICIENTS
+    if 'Z' in ZsdD:
+        scoeff = 1
+    else: 
+        scoeff = 2
+
+    CQcepstrum_temp = CQcepstrum[scoeff-1:cf+1,:]
+    # print(CQcepstrum_temp.shape)
+
+    f_d = 3 # delta window size
+
+    if ZsdD.replace('Z','') == 'sdD':
+        # print(Deltas(CQcepstrum_temp,f_d).shape)
+
+        CQcc = np.concatenate([CQcepstrum_temp, Deltas(CQcepstrum_temp,f_d),
+            Deltas(Deltas(CQcepstrum_temp,f_d),f_d)], axis=0)
+        # print(CQcc.shape)
+
+    elif ZsdD.replace('Z','') == 'sd':
+        CQcc = np.concatenate([CQcepstrum_temp, Deltas(CQcepstrum_temp,f_d)], axis=0)
+
+    elif ZsdD.replace('Z','') == 'sD':
+        CQcc = np.concatenate([CQcepstrum_temp, Deltas(Deltas(CQcepstrum_temp,f_d),f_d)], axis=0)
+
+    elif ZsdD.replace('Z','') == 's':
+        CQcc = CQcepstrum_temp
+
+    elif ZsdD.replace('Z','') == 'd':
+        CQcc = Deltas(CQcepstrum_temp,f_d)
+
+    elif ZsdD.replace('Z','') == 'D':
+        CQcc = Deltas(Deltas(CQcepstrum_temp,f_d),f_d)
+
+    elif ZsdD.replace('Z','') == 'dD':
+        CQcc = np.concatenate([Deltas(CQcepstrum_temp,f_d), Deltas(Deltas(CQcepstrum_temp,f_d),f_d)], axis=0)
+
+    return CQcc.T, LogP_absCQT.T, TimeVec, FreqVec, Ures_LogP_absCQT, Ures_FreqVec, absCQT
+
+def Deltas(x, hlen):
+    # % Delta and acceleration coefficients
+    # %
+    # % Reference:
+    # %   Young S.J., Evermann G., Gales M.J.F., Kershaw D., Liu X., Moore G., Odell J., Ollason D.,
+    # %   Povey D., Valtchev V. and Woodland P., The HTK Book (for HTK Version 3.4) December 2006.
+    # print(x.shape)
+    # print(hlen)
+    win = list(range(hlen, -hlen-1, -1))
+    # print(win)
+    
+    xx_1 = np.tile(x[:,0],(1,hlen)).reshape(hlen,-1).T
+    xx_2 = np.tile(x[:,-1],(1,hlen)).reshape(hlen,-1).T
+    xx = np.concatenate([xx_1, x, xx_2], axis=-1)
+    # print(xx.shape)     # (20, 476)
+
+    #####filter function in Matlab#####
+    D = scipy.signal.lfilter(win, 1, xx)  
+    # print("after filter:", D.shape)
+    
+    D = D[:,hlen*2:]
+    # print(D.shape)
+
+    D = D /(2*sum(np.arange(1,hlen+1))**2)
+    # print(D.shape)
+
+    return D
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\features\embeddings.py
+==================================================
+import pandas as pd
+import soundfile as sf
+import numpy as np
+import torch
+from transformers import AutoFeatureExtractor, WavLMForXVector, UniSpeechSatForXVector
+from tqdm import tqdm
+
+def envelope(y, rate, threshold=0.0005):
+    """Voice Activity Detection (VAD) based on rolling mean amplitude."""
+    mask = []
+    y_series = pd.Series(y).apply(np.abs)
+    y_mean = y_series.rolling(window=int(rate / 10), min_periods=1, center=True).mean()
+    for mean in y_mean:
+        mask.append(mean > threshold)
+    return mask
+
+def clean_audio(file_path):
+    """Loads audio and applies VAD mask."""
+    signal, rate = sf.read(file_path)
+    mask = envelope(signal, rate)
+    signal = signal[mask]
+    return signal, rate
+
+def extract_transformer_embeddings(samples_dict, model_type="wavlm"):
+    """
+    Extracts deep embeddings using either WavLM or UniSpeech-SAT.
+    Args:
+        samples_dict: Dict mapping label/key to list of filepaths.
+        model_type: 'wavlm' or 'unispeech'
+    """
+    feats = {key: [] for key in samples_dict}
+    total_samples = sum(len(paths) for paths in samples_dict.values())
+    
+    if model_type == "wavlm":
+        model_name = "microsoft/wavlm-base-plus-sv"
+        model_class = WavLMForXVector
+    elif model_type == "unispeech":
+        model_name = "microsoft/unispeech-sat-base-plus-sv"
+        model_class = UniSpeechSatForXVector
+    else:
+        raise ValueError("Invalid model_type. Choose 'wavlm' or 'unispeech'.")
+
+    print(f"Loading {model_name}...")
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+    model = model_class.from_pretrained(model_name)
+    model.eval()
+
+    with tqdm(total=total_samples, desc=f"Extracting {model_type} embeddings") as pbar:
+        for key, filepaths in samples_dict.items():
+            for filepath in filepaths:
+                signal, rate = clean_audio(filepath)
+                inputs = feature_extractor(signal, sampling_rate=rate, return_tensors="pt")
+                
+                with torch.no_grad():
+                    embeddings = model(**inputs).embeddings
+                
+                # Normalize and convert to numpy
+                embeddings = torch.nn.functional.normalize(embeddings, dim=-1).cpu().numpy()
+                feats[key].append(embeddings)
+                pbar.update(1)
+            
+            feats[key] = np.array(feats[key])
+
+    return feats
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\features\extract.py
+==================================================
+import librosa
+import numpy as np
+
+def extract_mfcc(waveform, sr=16000, n_mfcc=24):
+    """Extracts MFCC with Delta and Delta-Delta."""
+    mfcc = librosa.feature.mfcc(y=waveform, sr=sr, n_mfcc=n_mfcc)
+    delta = librosa.feature.delta(mfcc)
+    delta2 = librosa.feature.delta(delta)
+    feats = np.concatenate((mfcc, delta, delta2), axis=0)
+    return feats
+
+def extract_log_spectrum(waveform, sr=16000):
+    """Extracts log power magnitude spectrum."""
+    s = librosa.core.stft(waveform, n_fft=2048, win_length=2048, hop_length=512)
+    a = np.abs(s)**2
+    feat = librosa.power_to_db(a)
+    return feat
+
+def get_transform(feature_type):
+    """Returns a lambda transform based on desired feature type."""
+    if feature_type == 'mfcc':
+        return lambda x: extract_mfcc(x)
+    elif feature_type == 'spect':
+        return lambda x: extract_log_spectrum(x)
+    else:
+        raise ValueError("Unsupported feature type for direct extraction")
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\models\attention.py
+==================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+
+class SelfAttention(nn.Module):
+    """
+    Custom Self-Attention Mechanism designed to aggregate frame-level 
+    features into utterance-level representations for anti-spoofing.
+    """
+    def __init__(self, hidden_size, mean_only=False):
+        super(SelfAttention, self).__init__()
+        self.hidden_size = hidden_size
+        self.mean_only = mean_only
+        
+        # The learnable attention weight vector. It acts as a query to find 
+        # the most informative frames in the input sequence.
+        self.att_weights = nn.Parameter(torch.Tensor(1, hidden_size), requires_grad=True)
+        init.kaiming_uniform_(self.att_weights)
+
+    def forward(self, inputs):
+        """
+        Args:
+            inputs: Tensor of shape (Batch, Sequence_Length, Hidden_Size)
+        Returns:
+            representations: Aggregated utterance-level feature vector.
+        """
+        batch_size = inputs.size(0)
+        
+        # Step 1: Compute attention scores using batch matrix multiplication.
+        # We align the learnable weights with the batch dimensions.
+        weights = torch.bmm(
+            inputs, 
+            self.att_weights.permute(1, 0).unsqueeze(0).repeat(batch_size, 1, 1)
+        )
+
+        # Step 2: Apply non-linearity and softmax to get normalized attention weights.
+        if inputs.size(0) == 1:
+            attentions = F.softmax(torch.tanh(weights), dim=1)
+            weighted = torch.mul(inputs, attentions.expand_as(inputs))
+        else:
+            attentions = F.softmax(torch.tanh(weights.squeeze()), dim=1)
+            weighted = torch.mul(inputs, attentions.unsqueeze(2).expand_as(inputs))
+
+        # Step 3: Aggregate the sequence into a single vector representation.
+        if self.mean_only:
+            return weighted.sum(1)
+        else:
+            # Inject slight noise for regularization during std computation
+            noise = 1e-5 * torch.randn(weighted.size())
+            if inputs.is_cuda:
+                noise = noise.to(inputs.device)
+                
+            avg_repr = weighted.sum(1)
+            std_repr = (weighted + noise).std(1)
+            
+            # Concatenate mean and standard deviation for a richer representation
+            representations = torch.cat((avg_repr, std_repr), 1)
+            return representations
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\models\loss.py
+==================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2, weight=None, ignore_index=-100):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.ignore_index = ignore_index
+
+    def forward(self, input, target):
+        logpt = F.log_softmax(input, dim=1)
+        pt = torch.exp(logpt)
+        logpt = (1 - pt)**self.gamma * logpt
+        loss = F.nll_loss(logpt, target, self.weight, ignore_index=self.ignore_index)
+        return loss
+
+class OCSoftmax(nn.Module):
+    def __init__(self, feat_dim=256, r_real=0.9, r_fake=0.5, alpha=20.0):
+        super(OCSoftmax, self).__init__()
+        self.feat_dim = feat_dim
+        self.r_real = r_real
+        self.r_fake = r_fake
+        self.alpha = alpha
+        self.center = nn.Parameter(torch.randn(1, self.feat_dim))
+        nn.init.kaiming_uniform_(self.center, 0.25)
+        self.softplus = nn.Softplus()
+
+    def forward(self, x, labels):
+        w = F.normalize(self.center, p=2, dim=1)
+        x = F.normalize(x, p=2, dim=1)
+
+        scores = x @ w.transpose(0, 1)
+        output_scores = scores.clone()
+
+        scores[labels == 0] = self.r_real - scores[labels == 0]
+        scores[labels == 1] = scores[labels == 1] - self.r_fake
+
+        loss = self.softplus(self.alpha * scores).mean()
+        return loss, output_scores.squeeze(1)
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\models\resnet.py
+==================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+from .attention import SelfAttention
+
+class PreActBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride, downsample=None):
+        super(PreActBlock, self).__init__()
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.downsample = downsample
+
+    def forward(self, x):
+        out = F.relu(self.bn1(x))
+        shortcut = self.downsample(out) if self.downsample is not None else x
+        out = self.conv1(out)
+        out = self.conv2(F.relu(self.bn2(out)))
+        out += shortcut
+        return out
+
+class ResNetAttention(nn.Module):
+    """
+    ResNet backbone integrated with Custom Self-Attention.
+    Optimized for extracting spectrogram/MFCC/LFCC spatial features.
+    """
+    def __init__(self, enc_dim=256, nclasses=2):
+        super(ResNetAttention, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=(9, 3), stride=(3, 1), padding=(1, 1), bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.activation = nn.ReLU()
+
+        self.layer1 = self._make_layer(PreActBlock, 64, num_blocks=2, stride=1)
+        self.layer2 = self._make_layer(PreActBlock, 128, num_blocks=2, stride=2)
+        self.layer3 = self._make_layer(PreActBlock, 256, num_blocks=2, stride=2)
+        self.layer4 = self._make_layer(PreActBlock, 512, num_blocks=2, stride=2)
+
+        self.conv5 = nn.Conv2d(512, 256, kernel_size=(5, 3), stride=(1, 1), padding=(0, 1), bias=False)
+        self.bn5 = nn.BatchNorm2d(256)
+        
+        self.attention = SelfAttention(256)
+        
+        self.fc = nn.Linear(256 * 2, enc_dim)
+        self.fc_mu = nn.Linear(enc_dim, nclasses)
+
+        self.initialize_params()
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        downsample = None
+        if stride != 1 or self.in_planes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.in_planes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion)
+            )
+        layers = []
+        layers.append(block(self.in_planes, planes, stride, downsample))
+        self.in_planes = planes * block.expansion
+        for _ in range(1, num_blocks):
+            layers.append(block(self.in_planes, planes, 1))
+        return nn.Sequential(*layers)
+
+    def initialize_params(self):
+        for layer in self.modules():
+            if isinstance(layer, torch.nn.Conv2d):
+                init.kaiming_normal_(layer.weight, a=0, mode='fan_out')
+            elif isinstance(layer, torch.nn.Linear):
+                init.kaiming_uniform_(layer.weight)
+            elif isinstance(layer, torch.nn.BatchNorm2d):
+                layer.weight.data.fill_(1)
+                layer.bias.data.zero_()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.activation(self.bn1(x))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.conv5(x)
+        
+        batch_size, channels, freq, time = x.shape
+        x = self.activation(self.bn5(x)).view(batch_size, channels, -1)
+        
+        stats = self.attention(x.permute(0, 2, 1).contiguous())
+        
+        feat = self.fc(stats)
+        mu = self.fc_mu(feat)
+        return feat, mu
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\utils\metrics.py
+==================================================
+import numpy as np
+
+def compute_det_curve(target_scores, nontarget_scores):
+    n_scores = target_scores.size + nontarget_scores.size
+    all_scores = np.concatenate((target_scores, nontarget_scores))
+    labels = np.concatenate((np.ones(target_scores.size), np.zeros(nontarget_scores.size)))
+
+    indices = np.argsort(all_scores, kind='mergesort')
+    labels = labels[indices]
+
+    tar_trial_sums = np.cumsum(labels)
+    nontarget_trial_sums = nontarget_scores.size - (np.arange(1, n_scores + 1) - tar_trial_sums)
+
+    frr = np.concatenate((np.atleast_1d(0), tar_trial_sums / target_scores.size))
+    far = np.concatenate((np.atleast_1d(1), nontarget_trial_sums / nontarget_scores.size))
+    thresholds = np.concatenate((np.atleast_1d(all_scores[indices[0]] - 0.001), all_scores[indices]))
+
+    return frr, far, thresholds
+
+def compute_eer(target_scores, nontarget_scores):
+    frr, far, thresholds = compute_det_curve(target_scores, nontarget_scores)
+    abs_diffs = np.abs(frr - far)
+    min_index = np.argmin(abs_diffs)
+    eer = np.mean((frr[min_index], far[min_index]))
+    return eer, thresholds[min_index]
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\src\utils\utils.py
+==================================================
+import os
+import pandas as pd
+import numpy as np
+import soundfile as sf
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from sklearn.manifold import TSNE
+
+def get_label_distribution(label_path):
+    """Parses the ASVspoof protocol file and returns the distribution of labels."""
+    counts = defaultdict(int)
+    with open(label_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                counts[parts[4]] += 1
+    return dict(counts)
+
+def plot_tsne(features_dict, output_path, perplexity=30, n_iter=1000):
+    """
+    Plots 2D t-SNE embeddings for a dictionary of features.
+    Args:
+        features_dict: {"bonafide": np.array, "spoof": np.array}
+        output_path: Filepath to save the resulting PNG plot.
+    """
+    plt.figure(figsize=(10, 8))
+    colors = ['blue', 'red', 'green', 'orange']
+
+    for i, (label, feats) in enumerate(features_dict.items()):
+        if len(feats) == 0: continue
+        
+        tsne = TSNE(n_components=2, perplexity=perplexity, n_iter=n_iter, random_state=42)
+        embedded = tsne.fit_transform(feats)
+        
+        plt.scatter(embedded[:, 0], embedded[:, 1], label=label, color=colors[i % len(colors)], alpha=0.6)
+
+    plt.title('t-SNE Spatial Embeddings Visualization')
+    plt.legend()
+    plt.grid(True)
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path)
+    plt.close()
+
+def create_metadata_df(protocol_path, audio_dir):
+    """Creates a structured pandas DataFrame from the ASVspoof protocol text file."""
+    df = pd.read_csv(protocol_path, sep=" ", header=None)
+    df.columns = ['speaker_id', 'filename', 'null', 'system_id', 'class_name']
+    df.drop(columns=['null'], inplace=True)
+    df['filepath'] = df['filename'].apply(lambda x: os.path.join(audio_dir, x + '.flac'))
+    df['target'] = (df['class_name'] == 'spoof').astype(int)
+    return df
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\configs\config.py
+==================================================
+from dataclasses import dataclass
+import torch
+
+@dataclass
+class ProjectConfig:
+    # General Data Parameters
+    logical_data_root: str = '../Data/LA/'
+    physical_data_root: str = '../Data/PA/'
+    sample_rate: int = 16000
+    max_len: int = 64000
+    
+    # Deep Learning Training Parameters
+    num_epochs: int = 30
+    batch_size: int = 32
+    learning_rate: float = 0.0001
+    lr_decay: float = 0.5
+    weight_decay: float = 0.0005
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Model & Loss Parameters
+    feature_type: str = 'lfcc' # Options: 'mfcc', 'lfcc', 'cqcc', 'spect'
+    enc_dim: int = 256
+    add_loss: str = "ocsoftmax" # Options: 'softmax', 'amsoftmax', 'ocsoftmax'
+    r_real: float = 0.9
+    r_fake: float = 0.2
+    alpha: float = 20.0
+    
+    # ML Baseline Parameters
+    ml_max_len: int = 50
+    
+    # Output Paths
+    out_fold: str = './outputs/models/'
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\scripts\download_LA.bash
+==================================================
+# download LA dataset 
+# https://drive.google.com/file/d/1UGs1o2mDiBO9_iaN-0FupS8x0Tkb4xmt/view?usp=sharing
+# download agot data from Googledrive
+
+fileid="1UGs1o2mDiBO9_iaN-0FupS8x0Tkb4xmt"
+filename="LA.zip"
+curl -c ./cookie -s -L "https://drive.google.com/uc?export=download&id=${fileid}" > /dev/null
+curl -Lb ./cookie "https://drive.google.com/uc?export=download&confirm=`awk '/download/ {print $NF}' ./cookie`&id=${fileid}" -o ${filename}
+
+==================================================
+FILE: C:\Users\HAYKEL BARGUGUI\Desktop\Deepfake-Audio-Detection\scripts\prepare_data.bash
+==================================================
+#!/bin/bash
+
+echo "Preparing training data..."
+python3 src/data/data_processing.py \
+    --data_path ./Data/LA/ASVspoof2019_LA_train/flac \
+    --output_path ./Data/train.pkl \
+    --label_path ./Data/LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt
+
+echo "Preparing dev data..."
+python3 src/data/data_processing.py \
+    --data_path ./Data/LA/ASVspoof2019_LA_dev/flac \
+    --output_path ./Data/dev.pkl \
+    --label_path ./Data/LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt 
+
+echo "Preparing test data..."
+python3 src/data/data_processing.py \
+    --data_path ./Data/LA/ASVspoof2019_LA_eval/flac \
+    --output_path ./Data/eval.pkl \
+    --label_path ./Data/LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.eval.trl.txt
+
+==================================================
+FILE: README.md
+==================================================
+# ASVSpoof Anti-Spoofing Detection Framework
+
+This project targets Automatic Speaker Verification (ASV) anti-spoofing detection, specifically geared towards the ASVspoof datasets. It provides a robust, dual-pipeline framework featuring both Deep Learning end-to-end approaches and Classical Machine Learning baselines.
+
+## Architecture Description
+
+### Deep Learning Pipeline
+The core deep learning approach utilizes a **ResNet Architecture integrated with a Custom Self-Attention Mechanism**.
+1. **Feature Extraction:** Raw audio is padded and normalized before being transformed into specific frequency representations (MFCC, LFCC, or CQCC).
+2. **ResNet Backbone:** A modified ResNet utilizing `PreActBlocks` processes the 2D spatial features to capture local structural anomalies inherent to synthetic speech.
+3. **Custom Self-Attention Mechanism:** After the convolutional stages, the frequency axis is flattened. A custom self-attention mechanism computes learnable weights for the temporal sequence, dynamically identifying and aggregating the most informative frames into a compact, utterance-level representation. This module computes both the mean and standard deviation.
+4. **Classification:** The vector is passed through fully connected layers, optimized using custom margins like **OCSoftmax**.
+
+### Machine Learning Baselines
+For comparative robustness, the project includes classical ML techniques that operate on offline-extracted, flattened feature representations:
+* **Support Vector Machines (SVM)**
+* **LightGBM** (Gradient Boosting)
+
+## Dataset Context
+The framework is pre-configured to handle the **ASVspoof 2019** dataset configurations, supporting both Logical Access (LA) and Physical Access (PA).
+
+## Training and Validation Pipeline
+1. **Config:** All hyperparameters are centralized in `configs/config.py`.
+2. **Deep Learning:** Execute `python -m src.dl_train`.
+3. **Machine Learning:** Execute `python -m src.ml_train` after extracting offline features via the scripts in `src/features/`.
